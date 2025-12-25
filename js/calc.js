@@ -358,9 +358,15 @@ function calc_update() {
         return;
     }
 
-    if(bd >= 10 && ascent_rate < 4.8) {
-        set_warning('floater', "configuration suggests a possible floater");
+    if(mp > 3.0) {
+        set_warning('regulatory', "Payload mass may exceed 'heavy package' limits - please check you are compliance with your local regulations!");
     }
+
+    // Note - this warning will override the regulatory warning above.
+    if(bd >= 10 && ascent_rate < 4.8) {
+        set_warning('floater', "Configuration suggests a possible floater");
+    }
+
 
     ascent_rate = ascent_rate.toFixed(2);
     burst_altitude = burst_altitude.toFixed();
