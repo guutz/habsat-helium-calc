@@ -1,0 +1,694 @@
+---
+title: "Balloon Burst Altitude vs Helium Volume"
+subtitle: "Hwoyee balloon Pareto analysis — configurable flight time"
+format:
+  html:
+    code-fold: true
+    toc: true
+    toc-depth: 3
+    theme: flatly
+execute:
+  echo: true
+  warning: false
+---
+
+## Overview
+
+This notebook computes the trade-off between **helium fill volume** and **burst altitude** for different Hwoyee weather balloon sizes, across a range of payload masses (300–1700 g).
+
+The flight time is fixed (configurable via `FLIGHT_MINUTES`), which constrains the ascent rate given a target burst altitude. The system is then solved for the self-consistent burst altitude and helium volume using the force-balance equation.
+
+For each balloon size, the plot shows a **shaded plausible region** spanning the two burst-diameter inputs:
+
+-   burst diameters from the open-source balloon burst calculator code
+-   burst diameters read directly from the **Bursting Diamete** column of the Hwoyee specification sheet (converted from cm to m; ranges use midpoint, lower-bound-only values use the stated minimum)
+
+------------------------------------------------------------------------
+
+## Physical Model
+
+### Atmosphere: barometric pressure and volume scaling
+
+Air density decreases exponentially with altitude. Under the isothermal (single scale height) approximation, the volume a fixed mass of gas occupies scales as:
+
+$$V(h) = V_0 \cdot e^{h / H}$$
+
+where:
+
+-   $V(h)$ = gas volume at altitude $h$
+-   $V_0$ = gas volume at ground level (the **launch volume**)
+-   $H$ = atmospheric scale height (m), default $H = 7238.3$ m
+-   $h$ = altitude (m)
+
+Rearranging, the **launch volume** required to reach a burst volume $V_\text{burst}$ at altitude $h_\text{burst}$ is:
+
+$$V_\text{launch} = V_\text{burst} \cdot e^{-h_\text{burst} / H}$$
+
+### Burst volume from burst diameter
+
+The balloon is modeled as a sphere. Given a burst diameter $d_b$, the burst volume is:
+
+$$V_\text{burst} = \frac{4}{3} \pi \left(\frac{d_b}{2}\right)^3$$
+
+### Force balance at equilibrium ascent
+
+At steady ascent the net upward force (buoyancy minus weight) equals aerodynamic drag:
+
+$$\underbrace{V_\text{launch} \cdot (\rho_a - \rho_g) \cdot g}_{\text{gross lift}}
+- \underbrace{(m_b + m_p) \cdot g}_{\text{weight}}
+= \underbrace{\frac{1}{2} C_d \cdot \rho_a \cdot \pi r_\text{launch}^2 \cdot v^2}_{\text{drag}}$$
+
+where:
+
+| Symbol | Meaning | Default |
+|----------------------|-------------------------|-------------------------|
+| $\rho_a$ | Sea-level air density (kg/m³) | 1.2050 |
+| $\rho_g$ | Helium density (kg/m³) | 0.1786 |
+| $g$ | Gravitational acceleration (m/s²) | 9.81 |
+| $m_b$ | Balloon mass (kg) | varies by size |
+| $m_p$ | Payload mass (kg) | swept 0.3–1.7 |
+| $C_d$ | Drag coefficient (dimensionless) | 0.25 |
+| $r_\text{launch}$ | Balloon radius at ground level (m) | derived from $V_\text{launch}$ |
+| $v$ | Ascent rate (m/s) | derived from fixed flight time |
+
+### Closing the system with fixed flight time
+
+Fixing flight time $T$ (minutes) relates ascent rate to burst altitude:
+
+$$v = \frac{h_\text{burst}}{T \times 60}$$
+
+Substituting this and the barometric volume relation into the force balance gives a single equation in one unknown ($h_\text{burst}$), solved numerically via Brent's method.
+
+------------------------------------------------------------------------
+
+## Code
+
+```{python}
+import numpy as np
+from scipy.optimize import brentq
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURABLE PARAMETER — change this to explore different flight durations
+# ══════════════════════════════════════════════════════════════════════════════
+FLIGHT_MINUTES = 130      # target flight duration (minutes)
+# ══════════════════════════════════════════════════════════════════════════════
+
+FLIGHT_S = FLIGHT_MINUTES * 60   # convert to seconds for force-balance equation
+
+# ── Physical constants ─────────────────────────────────────────────────────────
+# RHO_A   : sea-level air density (kg/m³)
+# RHO_G   : helium density at STP (kg/m³)
+# H_SCALE : atmospheric scale height (m); H = RT/Mg
+#           R=8.314 J/mol·K, T≈288 K, M=0.029 kg/mol, g=9.81 m/s²  → H≈7238 m
+# GA      : gravitational acceleration (m/s²)
+# CD      : drag coefficient for a sphere (dimensionless); 0.25 for latex balloons
+# M3_TO_CF: unit conversion, 1 m³ = 35.3147 ft³
+RHO_A    = 1.2050
+RHO_G    = 0.1786
+H_SCALE  = 7238.3
+GA       = 9.81
+CD       = 0.25
+M3_TO_CF = 35.3147
+
+# ── Burst diameter source 1: calculator source code ───────────────────────────
+# Keys: balloon mass (g). Values: burst diameter (m).
+# Source: https://github.com/adamgreig/burst-calculator
+bd_code = {
+    200:  2.97,
+    300:  4.30,
+    350:  4.80,
+    500:  5.80,
+    600:  6.50,
+    750:  6.90,
+    800:  7.00,
+    1000: 8.00,
+    1200: 9.10,
+    1600: 10.00,
+    2000: 11.00,
+    3000: 12.00,
+}
+
+# ── Burst diameter source 2: Hwoyee spec sheet (Bursting Diamete column) ──────
+# Keys: balloon mass (g). Values: burst diameter (m).
+#
+# Spec sheet gives values in cm. Conversion notes:
+#   Range  (e.g. "650~750 cm") → midpoint used (700 cm = 7.00 m)
+#   Minimum (e.g. ">500 cm")   → stated minimum used as conservative estimate (5.00 m)
+#
+#   Mass  | Spec (cm)  | Used (m)
+#   ------+------------+---------
+#   200g  | >300       | 3.00
+#   300g  | >380       | 3.80
+#   350g  | >410       | 4.10
+#   500g  | >500       | 5.00
+#   600g  | 650~750    | 7.00  (midpoint)
+#   750g  | >650       | 6.50
+#   800g  | >680       | 6.80
+#   1000g | 800~900    | 8.50  (midpoint)
+#   1200g | >850       | 8.50
+#   1600g | >1050      | 10.50
+#   2000g | >1100      | 11.00
+#   3000g | >1300      | 13.00
+bd_spec = {
+    200:  3.00,
+    300:  3.80,
+    350:  4.10,
+    500:  5.00,
+    600:  7.00,
+    750:  6.50,
+    800:  6.80,
+    1000: 8.50,
+    1200: 8.50,
+    1600: 10.50,
+    2000: 11.00,
+    3000: 13.00,
+}
+
+# ── Core physics functions ─────────────────────────────────────────────────────
+
+def v_burst(bd):
+    """
+    Volume of a sphere at burst diameter bd.
+
+        V_burst = (4/3) * π * (d_b / 2)³
+
+    Parameters
+    ----------
+    bd : burst diameter (m)
+
+    Returns : burst volume (m³)
+    """
+    return (4/3) * np.pi * (bd / 2)**3
+
+
+def v_launch(h, bd):
+    """
+    Required launch volume to reach V_burst at altitude h.
+
+    From barometric volume scaling (gas expands as pressure drops with altitude):
+
+        V_launch = V_burst * exp(-h / H)
+
+    Parameters
+    ----------
+    h  : burst altitude (m)
+    bd : burst diameter (m)
+
+    Returns : launch volume (m³)
+    """
+    return v_burst(bd) * np.exp(-h / H_SCALE)
+
+
+def r_launch(h, bd):
+    """
+    Balloon radius at ground level, assuming a sphere:
+
+        r = (3 * V_launch / 4π)^(1/3)
+
+    Parameters
+    ----------
+    h  : burst altitude (m)
+    bd : burst diameter (m)
+
+    Returns : launch radius (m)
+    """
+    return (3 * v_launch(h, bd) / (4 * np.pi)) ** (1/3)
+
+
+def build_residual(mb_kg, bd):
+    """
+    Build a residual function with balloon-specific constants precomputed.
+
+    The residual is parameterized by payload mass only:
+        residual(h, mp_kg) = free_lift(h, mp_kg) - drag(h)
+    """
+    vb = v_burst(bd)
+    lift_scale = vb * (RHO_A - RHO_G) * GA
+    area0 = np.pi * (3 * vb / (4 * np.pi)) ** (2/3)
+    drag_scale = 0.5 * CD * RHO_A * area0 / (FLIGHT_S**2)
+    drag_exp_scale = -2.0 / (3.0 * H_SCALE)
+
+    def residual_for_payload(h, mp_kg):
+        exp_h = np.exp(-h / H_SCALE)
+        free_lift = lift_scale * exp_h - (mb_kg + mp_kg) * GA
+        drag = drag_scale * (h**2) * np.exp(drag_exp_scale * h)
+        return free_lift - drag
+
+    return residual_for_payload
+
+
+def solve_h_bracketed(residual_for_payload, mp_kg, h_hint=None,
+                     h_min=5000.0, h_max=45000.0, local_span=2500.0):
+    """
+    Solve for burst altitude with Brent's method, using adaptive bracketing.
+
+    If a hint is available (from neighboring payload), it first attempts a local
+    bracket around that altitude and expands outward before falling back to the
+    full [h_min, h_max] range.
+    """
+    if h_hint is None:
+        lo, hi = h_min, h_max
+        r_lo = residual_for_payload(lo, mp_kg)
+        r_hi = residual_for_payload(hi, mp_kg)
+    else:
+        span = local_span
+        found = False
+        while True:
+            lo = max(h_min, h_hint - span)
+            hi = min(h_max, h_hint + span)
+            r_lo = residual_for_payload(lo, mp_kg)
+            r_hi = residual_for_payload(hi, mp_kg)
+            if r_lo * r_hi <= 0:
+                found = True
+                break
+            if lo <= h_min and hi >= h_max:
+                break
+            span *= 1.8
+
+        if not found:
+            lo, hi = h_min, h_max
+            r_lo = residual_for_payload(lo, mp_kg)
+            r_hi = residual_for_payload(hi, mp_kg)
+
+    if r_lo * r_hi > 0:
+        return None
+
+    try:
+        return brentq(lambda h: residual_for_payload(h, mp_kg), lo, hi, maxiter=60)
+    except Exception:
+        return None
+
+
+def solve_curve(mb_kg, bd, payload_masses_kg):
+    """
+    Solve an entire payload sweep efficiently via continuation.
+
+    Each payload solve uses the previous root as a local bracket hint,
+    which significantly reduces average Brent iterations.
+    """
+    residual_for_payload = build_residual(mb_kg, bd)
+    h_solutions = np.full(payload_masses_kg.shape, np.nan, dtype=float)
+    h_prev = None
+
+    for i, mp_kg in enumerate(payload_masses_kg):
+        h = solve_h_bracketed(residual_for_payload, mp_kg, h_hint=h_prev)
+        if h is None:
+            continue
+        h_solutions[i] = h
+        h_prev = h
+
+    return h_solutions
+
+
+def build_envelope_data(mb_g, payload_masses_kg):
+    """
+    Build a shaded envelope spanning the two burst-diameter sources.
+
+    The envelope is the polygon bounded by the calculator-based curve and the
+    spec-sheet-based curve over payloads where both solutions exist.
+    """
+    mb_kg = mb_g / 1000.0
+    h_code = solve_curve(mb_kg, bd_code[mb_g], payload_masses_kg)
+    h_spec = solve_curve(mb_kg, bd_spec[mb_g], payload_masses_kg)
+    valid = np.isfinite(h_code) & np.isfinite(h_spec)
+    if not np.any(valid):
+        return None
+
+    vols_code = v_launch(h_code[valid], bd_code[mb_g]) * M3_TO_CF
+    vols_spec = v_launch(h_spec[valid], bd_spec[mb_g]) * M3_TO_CF
+    alts_code = h_code[valid] / 1000.0
+    alts_spec = h_spec[valid] / 1000.0
+
+    polygon_x = np.concatenate([vols_code, vols_spec[::-1]])
+    polygon_y = np.concatenate([alts_code, alts_spec[::-1]])
+
+    payload_valid = payload_masses_kg[valid]
+    idx_mid = int(np.argmin(np.abs(payload_valid - 1.0)))
+    idx_lo = 0
+    idx_hi = len(payload_valid) - 1
+
+    return {
+        "polygon_x": polygon_x,
+        "polygon_y": polygon_y,
+        "label_x": 0.5 * (vols_code[idx_mid] + vols_spec[idx_mid]),
+        "label_y": 0.5 * (alts_code[idx_mid] + alts_spec[idx_mid]),
+        "low_x": 0.5 * (vols_code[idx_lo] + vols_spec[idx_lo]),
+        "low_y": 0.5 * (alts_code[idx_lo] + alts_spec[idx_lo]),
+        "high_x": 0.5 * (vols_code[idx_hi] + vols_spec[idx_hi]),
+        "high_y": 0.5 * (alts_code[idx_hi] + alts_spec[idx_hi]),
+    }
+
+
+# ── Sweep ──────────────────────────────────────────────────────────────────────
+payload_masses_g = np.linspace(300, 1700, 60)
+payload_masses_kg = payload_masses_g / 1000.0
+# Only plot balloon sizes present in both dicts for a clean side-by-side comparison
+balloons = sorted(set(bd_code.keys()) & set(bd_spec.keys()))
+
+cmap   = plt.get_cmap("turbo")
+colors = {mb: cmap(i / (len(balloons) - 1)) for i, mb in enumerate(balloons)}
+
+fig, ax = plt.subplots(figsize=(13, 8))
+fig.patch.set_facecolor("#ffffff")
+ax.set_facecolor("#f9fafb")
+
+for mb_g in balloons:
+    color = colors[mb_g]
+    envelope = build_envelope_data(mb_g, payload_masses_kg)
+    if envelope is None:
+        continue
+
+    ax.fill(envelope["polygon_x"], envelope["polygon_y"],
+            facecolor=color, edgecolor=color, linewidth=1.2, alpha=0.22)
+
+    # Circle = lightest payload (300 g), square = heaviest (1700 g)
+    ax.scatter(envelope["low_x"], envelope["low_y"], color=color, s=50, marker="o",
+               zorder=6, edgecolors="white", linewidths=0.6)
+    ax.scatter(envelope["high_x"], envelope["high_y"], color=color, s=50, marker="s",
+               zorder=6, edgecolors="white", linewidths=0.6)
+
+    ax.annotate(f"{mb_g}g", (envelope["label_x"], envelope["label_y"]), fontsize=7.5,
+                color=color, fontweight="bold",
+                xytext=(5, 2), textcoords="offset points")
+
+ymin, ymax = ax.get_ylim()
+xmin, xmax = ax.get_xlim()
+
+ax.set_xlim(xmin, xmax)
+ax.set_ylim(ymin, ymax)
+
+# ── Legend ─────────────────────────────────────────────────────────────────────
+legend_elements = [
+    Line2D([0], [0], color="#666", lw=8, alpha=0.22,
+        label="Shaded band — range spanned by the two burst-diameter sources"),
+    Line2D([0], [0], color="#444", lw=0, marker="o", markersize=8,
+        markerfacecolor="#666", label="● = 300 g payload (light end of band)"),
+    Line2D([0], [0], color="#444", lw=0, marker="s", markersize=8,
+        markerfacecolor="#666", label="■ = 1700 g payload (heavy end of band)"),
+    Line2D([0], [0], color="none",
+        label="Along each band: heavier payload → right & down"),
+]
+ax.legend(handles=legend_elements, facecolor="white", edgecolor="#ccc",
+          fontsize=9, loc="lower right", framealpha=0.97)
+
+ax.set_xlabel("Helium Volume (ft³)", fontsize=12, color="#333")
+ax.set_ylabel("Burst Altitude (km)", fontsize=12, color="#333")
+ax.set_title(
+    f"Burst Altitude vs Helium Volume  ·  Hwoyee balloons  ·  {FLIGHT_MINUTES}-min fixed flight time\n"
+    "Each coloured curve = one balloon size  ·  payload swept 300 → 1700 g along each curve",
+    fontsize=11, color="#222", pad=12)
+
+ax.tick_params(colors="#444")
+for spine in ax.spines.values():
+    spine.set_edgecolor("#ccc")
+ax.grid(True, color="#e0e0e0", lw=0.8, ls="--")
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f} km"))
+
+plt.tight_layout()
+plt.show()
+```
+
+------------------------------------------------------------------------
+
+## Interpreting the Plot
+
+-   **Upper-left is best**: high burst altitude for low helium volume.
+-   **Moving right along a band** corresponds to increasing payload mass — a heavier payload requires more helium to maintain the ascent rate implied by the fixed flight time, and burst altitude drops because the larger launch volume leaves less room for expansion before the balloon reaches its burst diameter.
+-   **Band width**: shows disagreement between the two burst diameter sources. Where the spec sheet gives a range (e.g. 600g: 650\~750 cm), the midpoint is used; where it gives only a minimum (e.g. "\>500 cm"), the minimum is used as a conservative lower bound — the true burst diameter may be larger, shifting the plausible region upward and to the left.
+-   **Heavier balloons cluster upper-left**: larger burst diameters allow more expansion before rupture, reaching higher altitudes. The trade-off is the balloon mass itself requires more lift.
+
+------------------------------------------------------------------------
+
+## GIF Sweep: 60–180 minute flight time
+
+```{python}
+from IPython.display import HTML, display
+from matplotlib.animation import FuncAnimation, PillowWriter
+
+# Animation settings
+flight_minutes_frames = list(range(60, 181, 5))
+gif_path = "balloon_pareto_sweep_60_180.gif"
+fps = 6
+
+# Keep same payload and balloon sets as the static plot
+payload_masses_g_anim = np.linspace(300, 1700, 60)
+payload_masses_kg_anim = payload_masses_g_anim / 1000.0
+balloons_anim = sorted(set(bd_code.keys()) & set(bd_spec.keys()))
+
+
+def build_residual_for_flight(mb_kg, bd, flight_s):
+    vb = v_burst(bd)
+    lift_scale = vb * (RHO_A - RHO_G) * GA
+    area0 = np.pi * (3 * vb / (4 * np.pi)) ** (2/3)
+    drag_scale = 0.5 * CD * RHO_A * area0 / (flight_s**2)
+    drag_exp_scale = -2.0 / (3.0 * H_SCALE)
+
+    def residual_for_payload(h, mp_kg):
+        exp_h = np.exp(-h / H_SCALE)
+        free_lift = lift_scale * exp_h - (mb_kg + mp_kg) * GA
+        drag = drag_scale * (h**2) * np.exp(drag_exp_scale * h)
+        return free_lift - drag
+
+    return residual_for_payload
+
+
+def solve_curve_for_flight(mb_kg, bd, payload_masses_kg, flight_s):
+    residual_for_payload = build_residual_for_flight(mb_kg, bd, flight_s)
+    h_solutions = np.full(payload_masses_kg.shape, np.nan, dtype=float)
+    h_prev = None
+
+    for i, mp_kg in enumerate(payload_masses_kg):
+        h = solve_h_bracketed(residual_for_payload, mp_kg, h_hint=h_prev)
+        if h is None:
+            continue
+        h_solutions[i] = h
+        h_prev = h
+
+    return h_solutions
+
+
+def compute_frame_data(flight_minutes):
+    flight_s = flight_minutes * 60.0
+    frame_data = []
+
+    for mb_g in balloons_anim:
+        mb_kg = mb_g / 1000.0
+        color = colors[mb_g]
+        h_code = solve_curve_for_flight(mb_kg, bd_code[mb_g], payload_masses_kg_anim, flight_s)
+        h_spec = solve_curve_for_flight(mb_kg, bd_spec[mb_g], payload_masses_kg_anim, flight_s)
+        valid = np.isfinite(h_code) & np.isfinite(h_spec)
+        if not np.any(valid):
+            continue
+
+        vols_code = v_launch(h_code[valid], bd_code[mb_g]) * M3_TO_CF
+        vols_spec = v_launch(h_spec[valid], bd_spec[mb_g]) * M3_TO_CF
+        alts_code = h_code[valid] / 1000.0
+        alts_spec = h_spec[valid] / 1000.0
+
+        payload_valid = payload_masses_kg_anim[valid]
+        idx_mid = int(np.argmin(np.abs(payload_valid - 1.0)))
+        idx_lo = 0
+        idx_hi = len(payload_valid) - 1
+
+        frame_data.append({
+            "mb_g": mb_g,
+            "color": color,
+            "polygon_x": np.concatenate([vols_code, vols_spec[::-1]]),
+            "polygon_y": np.concatenate([alts_code, alts_spec[::-1]]),
+            "low_x": 0.5 * (vols_code[idx_lo] + vols_spec[idx_lo]),
+            "low_y": 0.5 * (alts_code[idx_lo] + alts_spec[idx_lo]),
+            "high_x": 0.5 * (vols_code[idx_hi] + vols_spec[idx_hi]),
+            "high_y": 0.5 * (alts_code[idx_hi] + alts_spec[idx_hi]),
+            "label": f"{mb_g}g",
+            "label_x": 0.5 * (vols_code[idx_mid] + vols_spec[idx_mid]),
+            "label_y": 0.5 * (alts_code[idx_mid] + alts_spec[idx_mid]),
+        })
+
+    return frame_data
+
+
+# Precompute all frame data once (faster animation + fixed global bounds)
+all_frames = {fm: compute_frame_data(fm) for fm in flight_minutes_frames}
+
+all_x, all_y = [], []
+for fm in flight_minutes_frames:
+    for item in all_frames[fm]:
+        if "polygon_x" in item:
+            all_x.extend(item["polygon_x"])
+            all_y.extend(item["polygon_y"])
+
+if not all_x or not all_y:
+    raise RuntimeError("No valid points found for GIF sweep.")
+
+# Global fixed axis bounds for every frame
+xmin, xmax = float(np.min(all_x)), float(np.max(all_x))
+ymin, ymax = float(np.min(all_y)), float(np.max(all_y))
+xpad = 0.03 * (xmax - xmin)
+ypad = 0.05 * (ymax - ymin)
+x_bounds = (xmin - xpad, xmax + xpad)
+y_bounds = (max(0.0, ymin - ypad), ymax + ypad)
+
+
+fig_anim, ax_anim = plt.subplots(figsize=(13, 8))
+
+
+def update(frame_idx):
+    fm = flight_minutes_frames[frame_idx]
+    ax_anim.clear()
+
+    fig_anim.patch.set_facecolor("#ffffff")
+    ax_anim.set_facecolor("#f9fafb")
+    ax_anim.set_xlim(*x_bounds)
+    ax_anim.set_ylim(*y_bounds)
+
+    label_points = []
+    for item in all_frames[fm]:
+        ax_anim.fill(item["polygon_x"], item["polygon_y"],
+                     facecolor=item["color"], edgecolor=item["color"],
+                     linewidth=1.2, alpha=0.22)
+        ax_anim.scatter(item["low_x"], item["low_y"], color=item["color"], s=50,
+                        marker="o", zorder=6, edgecolors="white", linewidths=0.6)
+        ax_anim.scatter(item["high_x"], item["high_y"], color=item["color"], s=50,
+                        marker="s", zorder=6, edgecolors="white", linewidths=0.6)
+        label_points.append(item)
+
+    for lp in label_points:
+        ax_anim.annotate(lp["label"], (lp["label_x"], lp["label_y"]), fontsize=7.5,
+                         color=lp["color"], fontweight="bold",
+                         xytext=(5, 2), textcoords="offset points")
+
+    legend_elements = [
+         Line2D([0], [0], color="#666", lw=8, alpha=0.22,
+             label="Shaded band — range spanned by the two burst-diameter sources"),
+        Line2D([0], [0], color="#444", lw=0, marker="o", markersize=8,
+               markerfacecolor="#666", label="● = 300 g payload"),
+        Line2D([0], [0], color="#444", lw=0, marker="s", markersize=8,
+               markerfacecolor="#666", label="■ = 1700 g payload"),
+    ]
+    ax_anim.legend(handles=legend_elements, facecolor="white", edgecolor="#ccc",
+                   fontsize=9, loc="lower right", framealpha=0.97)
+
+    ax_anim.set_xlabel("Helium Volume (ft³)", fontsize=12, color="#333")
+    ax_anim.set_ylabel("Burst Altitude (km)", fontsize=12, color="#333")
+    ax_anim.set_title(
+        f"Burst Altitude vs Helium Volume  ·  Hwoyee balloons  ·  {fm}-min fixed flight time\n"
+        "Each coloured curve = one balloon size  ·  payload swept 300 → 1700 g",
+        fontsize=11, color="#222", pad=12,
+    )
+
+    ax_anim.tick_params(colors="#444")
+    for spine in ax_anim.spines.values():
+        spine.set_edgecolor("#ccc")
+    ax_anim.grid(True, color="#e0e0e0", lw=0.8, ls="--")
+    ax_anim.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f} km"))
+
+
+anim = FuncAnimation(fig_anim, update, frames=len(flight_minutes_frames), interval=1000 / fps)
+anim.save(gif_path, writer=PillowWriter(fps=fps))
+plt.close(fig_anim)
+
+print(f"Saved GIF: {gif_path}")
+print(f"Fixed x-limits across frames: {x_bounds[0]:.1f} to {x_bounds[1]:.1f} ft³")
+print(f"Fixed y-limits across frames: {y_bounds[0]:.1f} to {y_bounds[1]:.1f} km")
+display(HTML(f'<img src="{gif_path}" alt="Flight-time sweep animation" style="max-width: 100%; height: auto;" />'))
+```
+
+------------------------------------------------------------------------
+
+## Fixed 600 g Payload: 90–120 minute flight-time sweeps
+
+```{python}
+payload_fixed_g = 600
+payload_fixed_kg = payload_fixed_g / 1000.0
+flight_minutes_sweep = np.arange(90, 121, 2)
+
+
+def solve_for_flight_minutes(mb_g, bd, flight_minutes, payload_kg):
+    mb_kg = mb_g / 1000.0
+    residual_for_payload = build_residual_for_flight(mb_kg, bd, flight_minutes * 60.0)
+    return solve_h_bracketed(residual_for_payload, payload_kg)
+
+
+fig_time, ax_time = plt.subplots(figsize=(13, 8))
+fig_time.patch.set_facecolor("#ffffff")
+ax_time.set_facecolor("#f9fafb")
+
+for mb_g in balloons:
+    color = colors[mb_g]
+    vols_code = []
+    alts_code = []
+    vols_spec = []
+    alts_spec = []
+
+    for flight_minutes in flight_minutes_sweep:
+        h_code = solve_for_flight_minutes(mb_g, bd_code[mb_g], flight_minutes, payload_fixed_kg)
+        h_spec = solve_for_flight_minutes(mb_g, bd_spec[mb_g], flight_minutes, payload_fixed_kg)
+        if h_code is None or h_spec is None:
+            continue
+
+        alts_code.append(h_code / 1000.0)
+        vols_code.append(v_launch(h_code, bd_code[mb_g]) * M3_TO_CF)
+        alts_spec.append(h_spec / 1000.0)
+        vols_spec.append(v_launch(h_spec, bd_spec[mb_g]) * M3_TO_CF)
+
+    if not vols_code:
+        continue
+
+    vols_code = np.array(vols_code)
+    alts_code = np.array(alts_code)
+    vols_spec = np.array(vols_spec)
+    alts_spec = np.array(alts_spec)
+
+    poly_x = np.concatenate([vols_code, vols_spec[::-1]])
+    poly_y = np.concatenate([alts_code, alts_spec[::-1]])
+    ax_time.fill(poly_x, poly_y, facecolor=color, edgecolor=color,
+                 linewidth=1.2, alpha=0.22)
+
+    low_x = 0.5 * (vols_code[0] + vols_spec[0])
+    low_y = 0.5 * (alts_code[0] + alts_spec[0])
+    high_x = 0.5 * (vols_code[-1] + vols_spec[-1])
+    high_y = 0.5 * (alts_code[-1] + alts_spec[-1])
+    ax_time.scatter(low_x, low_y, color=color, s=52, marker="o",
+                    zorder=6, edgecolors="white", linewidths=0.6)
+    ax_time.scatter(high_x, high_y, color=color, s=52, marker="s",
+                    zorder=6, edgecolors="white", linewidths=0.6)
+
+    idx_mid = len(vols_code) // 2
+    label_x = 0.5 * (vols_code[idx_mid] + vols_spec[idx_mid])
+    label_y = 0.5 * (alts_code[idx_mid] + alts_spec[idx_mid])
+    ax_time.annotate(f"{mb_g}g", (label_x, label_y), fontsize=7.5,
+                     color=color, fontweight="bold",
+                     xytext=(5, 2), textcoords="offset points")
+
+legend_elements_time = [
+    Line2D([0], [0], color="#666", lw=8, alpha=0.22,
+           label="Shaded band = range spanned by the two burst-diameter sources"),
+    Line2D([0], [0], color="#444", lw=0, marker="o", markersize=8,
+           markerfacecolor="#666", label="● = 90 min"),
+    Line2D([0], [0], color="#444", lw=0, marker="s", markersize=8,
+           markerfacecolor="#666", label="■ = 120 min"),
+    Line2D([0], [0], color="none",
+           label="Along each band: longer flight time → left & up"),
+]
+ax_time.legend(handles=legend_elements_time, facecolor="white", edgecolor="#ccc",
+               fontsize=9, loc="lower right", framealpha=0.97)
+
+ax_time.set_xlabel("Helium Volume (ft³)", fontsize=12, color="#333")
+ax_time.set_ylabel("Burst Altitude (km)", fontsize=12, color="#333")
+ax_time.set_title(
+    "Burst Altitude vs Helium Volume  ·  Fixed 600 g payload  ·  90–120 min flight-time sweep\n"
+    "Each coloured band = one balloon size  ·  duration swept 90 → 120 min",
+    fontsize=11, color="#222", pad=12,
+)
+
+ax_time.tick_params(colors="#444")
+for spine in ax_time.spines.values():
+    spine.set_edgecolor("#ccc")
+ax_time.grid(True, color="#e0e0e0", lw=0.8, ls="--")
+ax_time.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f} km"))
+
+plt.tight_layout()
+plt.show()
+```
